@@ -1,0 +1,90 @@
+name: 'runski: pick runner'
+description: >
+  Chooses a runs-on target: your self-hosted runski Macs when one is online,
+  otherwise a GitHub-hosted fallback. Prevents jobs from queueing forever when
+  every Mac is asleep, busy or offline.
+author: looskis
+branding:
+  icon: 'cpu'
+  color: 'gray-dark'
+inputs:
+  labels:
+    description: 'Comma-separated labels a runner must have (in addition to self-hosted). Default: runski'
+    required: false
+    default: 'runski'
+  fallback:
+    description: 'runs-on value to use when no matching runner is online (JSON array or a plain label).'
+    required: false
+    default: 'macos-latest'
+  require-idle:
+    description: 'If true, only pick a self-hosted runner that is online AND not busy.'
+    required: false
+    default: 'false'
+  token:
+    description: 'Token with read access to Actions runners (repo: admin read; org: manage_runners read).'
+    required: false
+    default: ${{ github.token }}
+  scope:
+    description: '"repo" (default) or "org" — where the runners are registered.'
+    required: false
+    default: 'repo'
+outputs:
+  runs-on:
+    description: 'JSON array to pass to runs-on, e.g. ["self-hosted","runski"] or ["macos-latest"].'
+    value: ${{ steps.pick.outputs.runs-on }}
+  self-hosted:
+    description: '"true" when a runski runner was selected.'
+    value: ${{ steps.pick.outputs.self-hosted }}
+  runner:
+    description: 'Name of the selected self-hosted runner, if any.'
+    value: ${{ steps.pick.outputs.runner }}
+runs:
+  using: composite
+  steps:
+    - id: pick
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        LABELS: ${{ inputs.labels }}
+        FALLBACK: ${{ inputs.fallback }}
+        REQUIRE_IDLE: ${{ inputs.require-idle }}
+        SCOPE: ${{ inputs.scope }}
+      run: |
+        set -euo pipefail
+        if [ "$SCOPE" = "org" ]; then
+          api="orgs/${GITHUB_REPOSITORY_OWNER}/actions/runners"
+        else
+          api="repos/${GITHUB_REPOSITORY}/actions/runners"
+        fi
+        runners=$(gh api --paginate "$api" -q '.runners[]' 2>/dev/null || echo "")
+        wanted=$(echo "$LABELS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' || true)
+        chosen=""
+        while IFS= read -r r; do
+          [ -z "$r" ] && continue
+          status=$(echo "$r" | jq -r '.status')
+          busy=$(echo "$r" | jq -r '.busy')
+          name=$(echo "$r" | jq -r '.name')
+          [ "$status" = "online" ] || continue
+          if [ "$REQUIRE_IDLE" = "true" ] && [ "$busy" = "true" ]; then continue; fi
+          ok=1
+          for l in $wanted; do
+            echo "$r" | jq -e --arg l "$l" '[.labels[].name | ascii_downcase] | index($l | ascii_downcase) != null' >/dev/null || ok=0
+          done
+          if [ "$ok" = "1" ]; then chosen="$name"; break; fi
+        done <<< "$runners"
+        if [ -n "$chosen" ]; then
+          labels_json=$(printf '%s\n' "self-hosted" $wanted | jq -R . | jq -sc .)
+          echo "runs-on=$labels_json" >> "$GITHUB_OUTPUT"
+          echo "self-hosted=true" >> "$GITHUB_OUTPUT"
+          echo "runner=$chosen" >> "$GITHUB_OUTPUT"
+          echo "::notice::runski: dispatching to self-hosted runner '$chosen' ($labels_json)"
+        else
+          case "$FALLBACK" in
+            \[*) fb="$FALLBACK" ;;
+            *) fb=$(printf '%s' "$FALLBACK" | jq -Rc '[.]') ;;
+          esac
+          echo "runs-on=$fb" >> "$GITHUB_OUTPUT"
+          echo "self-hosted=false" >> "$GITHUB_OUTPUT"
+          echo "runner=" >> "$GITHUB_OUTPUT"
+          echo "::notice::runski: no online runner with labels [$LABELS]; falling back to $fb"
+        fi
